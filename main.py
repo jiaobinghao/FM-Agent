@@ -3,6 +3,7 @@ from src.file_utils import collect_file_names, is_file_ready
 from src.verification import streaming_reasoner
 from src.extract import run_extraction, EXT_TO_LANG
 from src.generate_topdown_layers import generate_topdown_layers
+import argparse
 import os
 import sys
 import json
@@ -53,6 +54,149 @@ def _deduplicate_phases(phases_dir):
 
     with open(phases_path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _normalize_rel_path(path):
+    """Normalize a relative path to the slash-separated form used in phases.json."""
+    return os.path.normpath(path).replace(os.sep, "/")
+
+
+def _is_under_dir(path, parent):
+    """Return True if path is inside parent or equal to parent."""
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(parent)]) == os.path.abspath(parent)
+    except ValueError:
+        return False
+
+
+def _is_supported_source_file(rel_path):
+    ext = rel_path.rsplit(".", 1)[-1] if "." in rel_path else ""
+    return ext in EXT_TO_LANG
+
+
+def _run_git(git_dir, args):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", git_dir, *args],
+            text=True,
+            stderr=subprocess.PIPE,
+        ).strip()
+    except subprocess.CalledProcessError as e:
+        msg = e.stderr.strip() if e.stderr else str(e)
+        raise RuntimeError(msg) from e
+
+
+def _build_commit_scope(proj_dir, requested_commit):
+    """Resolve a git revision and collect changed source files under proj_dir."""
+    proj_abs = os.path.abspath(proj_dir)
+    git_root = _run_git(proj_abs, ["rev-parse", "--show-toplevel"])
+    git_root = os.path.abspath(git_root)
+    resolved_commit = _run_git(
+        git_root,
+        ["rev-parse", "--verify", f"{requested_commit}^{{commit}}"],
+    )
+    changed = _run_git(
+        git_root,
+        ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", resolved_commit],
+    )
+
+    included = []
+    skipped = []
+    seen = set()
+    for git_rel in [line.strip() for line in changed.splitlines() if line.strip()]:
+        git_abs = os.path.abspath(os.path.join(git_root, git_rel))
+        if not _is_under_dir(git_abs, proj_abs):
+            skipped.append({"path": git_rel, "reason": "outside_project_dir"})
+            continue
+        proj_rel = _normalize_rel_path(os.path.relpath(git_abs, proj_abs))
+        if proj_rel.startswith("fm_agent/") or proj_rel.startswith("fm_agent_commit/"):
+            skipped.append({"path": proj_rel, "reason": "fm_agent_workspace"})
+            continue
+        if not os.path.exists(git_abs):
+            skipped.append({"path": proj_rel, "reason": "file_deleted_or_missing"})
+            continue
+        if not os.path.isfile(git_abs):
+            skipped.append({"path": proj_rel, "reason": "not_a_file"})
+            continue
+        if not _is_supported_source_file(proj_rel):
+            skipped.append({"path": proj_rel, "reason": "unsupported_extension"})
+            continue
+        if proj_rel not in seen:
+            included.append(proj_rel)
+            seen.add(proj_rel)
+
+    return {
+        "requested_commit": requested_commit,
+        "resolved_commit": resolved_commit,
+        "git_root": git_root,
+        "project_dir": proj_abs,
+        "included_source_files": included,
+        "skipped_files": skipped,
+    }
+
+
+def _write_commit_scope(scope, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    scope_path = os.path.join(output_dir, "commit_scope.json")
+    with open(scope_path, "w") as f:
+        json.dump(scope, f, indent=2)
+    return scope_path
+
+
+def _print_commit_scope_summary(scope, scope_path=None):
+    included = scope.get("included_source_files", [])
+    skipped = scope.get("skipped_files", [])
+    print("[Pipeline] Commit scope:")
+    print(f"  requested_commit: {scope['requested_commit']}")
+    print(f"  resolved_commit: {scope['resolved_commit']}")
+    print(f"  included_source_files: {len(included)}")
+    for rel in included:
+        print(f"    - {rel}")
+    print(f"  skipped_files: {len(skipped)}")
+    if scope_path:
+        print(f"  scope_file: {scope_path}")
+
+
+def _filter_phases_by_commit_scope(phases_dir, included_source_files):
+    """Keep only commit-scoped source files in phases.json. Return kept file count."""
+    phases_path = os.path.join(phases_dir, "phases.json")
+    with open(phases_path, "r") as f:
+        data = json.load(f)
+
+    allowed = set(_normalize_rel_path(path) for path in included_source_files)
+    phases_to_remove = []
+    kept_count = 0
+    for phase in data.get("phases", []):
+        filtered_modules = []
+        for module in phase.get("modules", []):
+            kept_files = [
+                sf for sf in module.get("source_files", [])
+                if _normalize_rel_path(sf) in allowed
+            ]
+            if kept_files:
+                module["source_files"] = kept_files
+                filtered_modules.append(module)
+                kept_count += len(kept_files)
+        phase["modules"] = filtered_modules
+        if not filtered_modules:
+            phases_to_remove.append(phase)
+
+    for phase in phases_to_remove:
+        data["phases"].remove(phase)
+
+    old_to_new = {}
+    for idx, phase in enumerate(sorted(data.get("phases", []), key=lambda p: p["phase"]), start=1):
+        old_to_new[phase["phase"]] = idx
+        phase["phase"] = idx
+    for phase in data.get("phases", []):
+        phase["depends_on_phases"] = [
+            old_to_new[dep] for dep in phase.get("depends_on_phases", [])
+            if dep in old_to_new
+        ]
+
+    with open(phases_path, "w") as f:
+        json.dump(data, f, indent=2)
+    return kept_count
 
 def _setup_logging(work_dir):
     """Configure logging to write to a file in work_dir."""
@@ -205,7 +349,7 @@ def _has_source_code(proj_dir):
     return False
 
 
-def run_pipeline(proj_dir):
+def run_pipeline(proj_dir, commit=None, commit_dry_run=False):
     if not os.path.isdir(proj_dir):
         print(f"[Pipeline] ERROR: proj_dir does not exist or is not a directory: {proj_dir}")
         sys.exit(1)
@@ -214,6 +358,31 @@ def run_pipeline(proj_dir):
         print(f"[Pipeline] ERROR: No source code files found in {proj_dir}. "
               f"Supported extensions: {', '.join(sorted(EXT_TO_LANG.keys()))}")
         sys.exit(1)
+
+    commit_scope = None
+    if commit:
+        try:
+            commit_scope = _build_commit_scope(proj_dir, commit)
+        except RuntimeError as e:
+            print(f"[Pipeline] ERROR: failed to resolve commit '{commit}': {e}")
+            sys.exit(1)
+
+        if commit_dry_run:
+            scope_path = _write_commit_scope(
+                commit_scope,
+                os.path.join(proj_dir, "fm_agent_commit"),
+            )
+            _print_commit_scope_summary(commit_scope, scope_path)
+            return
+
+        if not commit_scope["included_source_files"]:
+            scope_path = _write_commit_scope(
+                commit_scope,
+                os.path.join(proj_dir, "fm_agent_commit"),
+            )
+            _print_commit_scope_summary(commit_scope, scope_path)
+            print("[Pipeline] Commit mode: no supported source files under the project directory. Nothing to run.")
+            return
 
     work_dir = os.path.join(proj_dir, "fm_agent")
     input_dir = os.path.join(work_dir, "extracted_functions")
@@ -225,6 +394,10 @@ def run_pipeline(proj_dir):
 
     _setup_logging(work_dir)
     log_file = open(os.path.join(work_dir, "fm_agent.log"), "a")
+    if commit_scope:
+        scope_path = _write_commit_scope(commit_scope, work_dir)
+        logging.info("Commit scope written to %s", scope_path)
+        _print_commit_scope_summary(commit_scope, scope_path)
 
     # Initialize opencode in the project directory (skip if AGENTS.md already exists)
     agent_md = os.path.join(proj_dir, "AGENTS.md")
@@ -299,6 +472,17 @@ def run_pipeline(proj_dir):
 
     # Deduplicate source files across phases
     _deduplicate_phases(work_dir)
+    if commit_scope:
+        kept_count = _filter_phases_by_commit_scope(
+            work_dir,
+            commit_scope["included_source_files"],
+        )
+        print(f"[Pipeline] Commit mode: retained {kept_count} source file(s) in phases.json.")
+        logging.info("Commit mode retained %d source file(s) in phases.json", kept_count)
+        if kept_count == 0:
+            print("[Pipeline] Commit mode: phases.json does not contain changed source files. Nothing to run.")
+            log_file.close()
+            return
 
     # Run function extraction using extract.py
     print("[Pipeline] Extracting functions from source files...")
@@ -509,12 +693,34 @@ def run_pipeline(proj_dir):
     print("[Pipeline] Done.")
 
 
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Run FM-Agent on a project directory.",
+    )
+    parser.add_argument("proj_dir", help="Target project directory to analyze.")
+    parser.add_argument(
+        "--commit",
+        help="Analyze only source files changed by this single git commit-ish.",
+    )
+    parser.add_argument(
+        "--commit-dry-run",
+        action="store_true",
+        help="Resolve --commit and write fm_agent_commit/commit_scope.json without running OpenCode.",
+    )
+    args = parser.parse_args(argv)
+    if args.commit_dry_run and not args.commit:
+        parser.error("--commit-dry-run requires --commit")
+    return args
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 main.py <proj_dir>")
-        sys.exit(1)
+    args = _parse_args(sys.argv[1:])
 
     start_time = time.time()
-    run_pipeline(os.path.abspath(sys.argv[1]))
+    run_pipeline(
+        os.path.abspath(args.proj_dir),
+        commit=args.commit,
+        commit_dry_run=args.commit_dry_run,
+    )
     end_time = time.time()
     logging.info(f"Total time: {end_time - start_time:.2f} seconds")
