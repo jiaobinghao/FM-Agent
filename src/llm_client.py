@@ -12,7 +12,12 @@ _MAX_RATE_LIMIT_RETRIES = 20
 def _retry_create(client, model, messages):
     for attempt in range(_MAX_RATE_LIMIT_RETRIES):
         try:
-            response = client.chat.completions.create(model=model, messages=messages)
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                reasoning_effort="high",
+                extra_body={"thinking": {"type": "enabled"}},
+            )
             return response.choices[0].message.content
         except BadRequestError:
             raise

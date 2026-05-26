@@ -30,6 +30,13 @@ EXT_TO_LANG = {
 }
 
 
+def _opencode_env(proj_dir):
+    env = {**os.environ, "PWD": os.path.abspath(proj_dir)}
+    if os.environ.get("OPENROUTER_API_KEY") and not env.get("DEEPSEEK_API_KEY"):
+        env["DEEPSEEK_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
+    return env
+
+
 def streaming_reasoner(input_dir, output_dir, file_list=None, proj_dir=None, work_dir=None, poll_interval=2, spec_proc=None, spec_procs=None, already_processed=None):
     """Continuously watch input_dir for ready files, verify them, and validate bugs."""
     if work_dir is None:
@@ -318,10 +325,10 @@ def _validate_single_bug(result_json_rel, proj_dir, work_dir=None):
     try:
         with open(log_path, "a") as log_file:
             subprocess.run(
-                ["opencode", "run", "--model", f"openrouter/{OPENCODE_BUG_VALIDATION_MODEL}",
+                ["opencode", "run", "--model", f"deepseek/{OPENCODE_BUG_VALIDATION_MODEL}",
                  "--file", prompt_path,
                  "--", "Follow the instructions in the attached file"],
-                cwd=proj_dir, env={**os.environ, "PWD": os.path.abspath(proj_dir)}, check=True,
+                cwd=proj_dir, env=_opencode_env(proj_dir), check=True,
                 stdout=log_file, stderr=log_file,
             )
     finally:

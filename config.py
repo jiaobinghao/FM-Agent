@@ -1,8 +1,8 @@
 import os
 
 LLM_OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-LLM_OPENROUTER_API_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = "anthropic/claude-sonnet-4.6"
+LLM_OPENROUTER_API_BASE_URL = "https://api.deepseek.com"
+LLM_MODEL = "deepseek-v4-pro"
 
 OPENCODE_SETUP_MODEL = LLM_MODEL
 OPENCODE_SPEC_MODEL = LLM_MODEL

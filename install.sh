@@ -71,7 +71,20 @@ else
     export PATH="$BUN_INSTALL/bin:$PATH"
 fi
 echo "[..] installing/updating oh-my-openagent"
-bunx oh-my-openagent install
+## bunx oh-my-openagent install
+
+bunx oh-my-openagent install \
+  --no-tui \
+  --claude=no \
+  --openai=no \
+  --gemini=no \
+  --copilot=no \
+  --opencode-go=no \
+  --opencode-zen=no \
+  --zai-coding-plan=no \
+  --kimi-for-coding=no \
+  --vercel-ai-gateway=no \
+  --skip-auth
 
 echo ""
 echo "=== all dependencies installed ==="
