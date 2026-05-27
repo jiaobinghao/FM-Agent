@@ -184,14 +184,12 @@ def _filter_phases_by_commit_scope(phases_dir, included_source_files):
     for phase in phases_to_remove:
         data["phases"].remove(phase)
 
-    old_to_new = {}
-    for idx, phase in enumerate(sorted(data.get("phases", []), key=lambda p: p["phase"]), start=1):
-        old_to_new[phase["phase"]] = idx
-        phase["phase"] = idx
+    data["phases"] = sorted(data.get("phases", []), key=lambda p: p["phase"])
+    kept_phase_numbers = {phase["phase"] for phase in data["phases"]}
     for phase in data.get("phases", []):
         phase["depends_on_phases"] = [
-            old_to_new[dep] for dep in phase.get("depends_on_phases", [])
-            if dep in old_to_new
+            dep for dep in phase.get("depends_on_phases", [])
+            if dep in kept_phase_numbers
         ]
 
     with open(phases_path, "w") as f:
